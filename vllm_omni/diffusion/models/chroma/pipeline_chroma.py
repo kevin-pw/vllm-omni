@@ -1,114 +1,71 @@
 """
 Chroma1-HD text-to-image pipeline adapter for vllm-omni.
 
-Wraps diffusers' ChromaPipeline inside an nn.Module, transparently
-delegating attribute access so that the framework can reach .vae,
-.transformer, .scheduler, .device, etc.
+Wraps diffusers' ChromaPipeline inside an nn.Module-compatible shell,
+translating OmniDiffusionRequest prompt dicts into the plain strings
+that diffusers expects.
 """
-
-import warnings
-from collections.abc import Iterable
-
-# Suppress known deprecation warnings from diffusers internals
-warnings.filterwarnings(
-    "ignore", message=".*FluxPosEmbed.*is deprecated.*"
-)
-warnings.filterwarnings(
-    "ignore", message=".*torch_dtype.*is deprecated.*Use.*dtype.*instead.*"
-)
 
 import torch
 import torch.nn as nn
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
 
 from diffusers import ChromaPipeline as DiffusersChromaPipeline
 
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.config import OmniDiffusionConfig
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 
-# Names of pipeline components that the framework may assign to
-# (e.g. `model.transformer = regionally_compile(model.transformer)`)
+# Attribute names that should be read from / written to the wrapped
+# diffusers pipeline rather than the nn.Module wrapper itself.
 _PIPELINE_COMPONENTS = frozenset(
     {"transformer", "vae", "text_encoder", "tokenizer", "scheduler"}
 )
 
 
 class ChromaPipeline(nn.Module):
-    """
-    nn.Module wrapper around diffusers' ChromaPipeline.
+    """nn.Module wrapper around diffusers' ChromaPipeline."""
 
-    Key design decisions
-    --------------------
-    * The real diffusers pipeline is stored as ``self._pipe``, a plain
-      ``__dict__`` entry (DiffusersChromaPipeline is NOT nn.Module, so
-      nn.Module.__setattr__ does not register it as a submodule).
-    * ``named_parameters()`` is therefore empty → ``load_weights()`` is
-      a harmless no-op (all weights were already loaded by
-      ``from_pretrained``).
-    * ``__getattr__`` falls back to ``self._pipe``, exposing ``.vae``,
-      ``.transformer``, ``.scheduler``, ``.device``, … to the framework.
-    * ``__setattr__`` intercepts component assignments (e.g. after
-      ``torch.compile``) and forwards them to ``self._pipe``.
-    """
-
-    # Block class names used by torch.compile regional compilation
     _repeated_blocks = [
         "ChromaTransformerBlock",
         "ChromaSingleTransformerBlock",
     ]
 
-    # No external weight files — from_pretrained loaded everything
+    # No external weight sources – from_pretrained loaded everything.
     weights_sources = ()
 
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
-    def __init__(self, od_config: "OmniDiffusionConfig"):
+    def __init__(self, od_config: OmniDiffusionConfig):
         super().__init__()
 
         model_path = od_config.model
 
-        # Detect which device the framework wants (set via the
-        # ``with target_device:`` context manager in diffusers_loader).
-        target = torch.empty(0).device
+        # Let diffusers handle all weight loading and config parsing.
+        pipe = DiffusersChromaPipeline.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+        )
 
-        # Load on CPU first, regardless of the outer device context,
-        # to avoid blowing GPU memory with intermediate allocations.
-        with torch.device("cpu"):
-            pipe = DiffusersChromaPipeline.from_pretrained(
-                model_path,
-                torch_dtype=torch.bfloat16,
-            )
-
-        # Move to the target device when it is a GPU
-        if target.type != "cpu":
-            pipe = pipe.to(target)
-
-        # Stored as a plain dict attribute — NOT a registered submodule
+        # Store as a plain dict attribute – NOT a registered submodule.
+        # (DiffusersChromaPipeline is not an nn.Module.)
         self._pipe = pipe
 
     # ------------------------------------------------------------------
-    # Transparent attribute delegation
+    # Transparent attribute delegation so that the framework can
+    # access .vae, .transformer, .scheduler, .device, etc.
     # ------------------------------------------------------------------
     def __getattr__(self, name: str):
-        """Fall back to the wrapped diffusers pipeline for any attribute
-        the nn.Module itself does not have (.vae, .transformer,
-        .scheduler, .text_encoder, .device, …)."""
-        # Guard: during __init__, _pipe may not exist yet
         _pipe = self.__dict__.get("_pipe")
         if _pipe is not None:
             try:
                 return getattr(_pipe, name)
             except AttributeError:
                 pass
-        # Default nn.Module behaviour (checks _modules, _parameters, …)
         return super().__getattr__(name)
 
     def __setattr__(self, name: str, value):
-        """Forward component assignments to the wrapped pipeline so that
-        e.g. ``model.transformer = compiled_transformer`` propagates."""
         if name in _PIPELINE_COMPONENTS and "_pipe" in self.__dict__:
             setattr(self._pipe, name, value)
             return
@@ -122,14 +79,11 @@ class ChromaPipeline(nn.Module):
         return self
 
     # ------------------------------------------------------------------
-    # Weight loading — no-op
+    # Weight loading – no-op (already loaded by from_pretrained)
     # ------------------------------------------------------------------
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ):
-        """All weights were loaded by from_pretrained.
-        Consume the (empty) iterator and return None to skip the
-        loaded-weights check."""
         for _ in weights:
             pass
         return None
@@ -137,48 +91,92 @@ class ChromaPipeline(nn.Module):
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
-    def forward(self, request: "OmniDiffusionRequest"):
-        sp = request.sampling_params
+    def forward(self, req: OmniDiffusionRequest):
+        """Extract prompts from the OmniDiffusionRequest and run the
+        diffusers ChromaPipeline.
 
-        output = self._pipe(
-            prompt=request.prompts,
-            negative_prompt=(
-                getattr(request, "negative_prompt", None)
-                or getattr(request, "negative_prompts", None)
-            ),
-            num_inference_steps=(
-                getattr(sp, "num_inference_steps", None) or 40
-            ),
-            guidance_scale=(
-                getattr(sp, "guidance_scale", None) or 3.0
-            ),
-            height=(
-                getattr(sp, "height", None)
-                or getattr(request, "height", None)
-            ),
-            width=(
-                getattr(sp, "width", None)
-                or getattr(request, "width", None)
-            ),
-            num_images_per_prompt=getattr(
-                sp, "num_images_per_prompt", 1
-            ),
-            generator=getattr(sp, "generator", None),
+        req.prompts is a list where each element is either:
+          - str:  a plain prompt string
+          - dict: {"prompt": "...", "negative_prompt": "...", ...}
+
+        This follows the same extraction pattern used by the existing
+        FluxPipeline.forward() in pipeline_flux.py.
+        """
+
+        # ----- prompt extraction (same pattern as FluxPipeline) ------
+        prompts_raw = req.prompts or []
+
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "")
+            for p in prompts_raw
+        ]
+
+        # Extract negative prompts only if at least one exists
+        negative_prompt = None
+        if all(
+            isinstance(p, str) or p.get("negative_prompt") is None
+            for p in prompts_raw
+        ):
+            negative_prompt = None
+        elif prompts_raw:
+            negative_prompt = [
+                "" if isinstance(p, str)
+                else (p.get("negative_prompt") or "")
+                for p in prompts_raw
+            ]
+
+        # ----- sampling parameters -----------------------------------
+        sp = req.sampling_params
+
+        height = getattr(sp, "height", None) or 1024
+        width = getattr(sp, "width", None) or 1024
+        num_inference_steps = (
+            getattr(sp, "num_inference_steps", None) or 40
         )
-        return output.images
+        guidance_scale = (
+            sp.guidance_scale
+            if getattr(sp, "guidance_scale", None) is not None
+            else 3.0
+        )
+        generator = getattr(sp, "generator", None)
+        num_images_per_prompt = max(
+            getattr(sp, "num_outputs_per_prompt", 0), 1
+        )
+
+        # ----- run diffusers pipeline --------------------------------
+        output = self._pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            height=height,
+            width=width,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+        )
+
+        # Return DiffusionOutput.  The diffusers pipeline already
+        # returns fully post-processed PIL images, so our
+        # get_chroma_post_process_func is a pass-through.
+        return DiffusionOutput(output=output.images)
 
 
-# ── pre / post processing (pass-through for pure T2I) ────────────────
+# ── pre / post processing ────────────────────────────────────────────
 
 
-def get_chroma_pre_process_func(od_config: "OmniDiffusionConfig"):
+def get_chroma_pre_process_func(od_config: OmniDiffusionConfig):
+    """No pre-processing needed for pure text-to-image."""
+
     def pre_process(request):
         return request
 
     return pre_process
 
 
-def get_chroma_post_process_func(od_config: "OmniDiffusionConfig"):
+def get_chroma_post_process_func(od_config: OmniDiffusionConfig):
+    """The diffusers pipeline already returns PIL images,
+    so post-processing is a pass-through."""
+
     def post_process(images):
         return images
 
