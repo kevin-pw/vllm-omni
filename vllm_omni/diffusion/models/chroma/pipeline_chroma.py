@@ -1,9 +1,5 @@
 """
 Chroma1-HD text-to-image pipeline for vllm-omni.
-
-Minimal adapter that wraps diffusers' ChromaPipeline to work within
-the vllm-omni diffusion framework.  All heavy lifting (text encoding,
-denoising loop, VAE decode) is delegated to diffusers.
 """
 
 import torch
@@ -19,35 +15,50 @@ if TYPE_CHECKING:
 class ChromaPipeline(DiffusersChromaPipeline):
     """
     Chroma text-to-image pipeline adapted for vllm-omni.
-
-    Inherits from diffusers' ChromaPipeline so that ``from_pretrained``
-    and all component loading (T5, ChromaTransformer2DModel, VAE,
-    scheduler) work out of the box.
     """
 
-    # Block class names inside ChromaTransformer2DModel used by
-    # torch.compile to identify the repeated computation.
-    # Verify against your diffusers version; if the names changed,
-    # update them here – the model will still run, just without the
-    # compile speed-up.
     _repeated_blocks = [
         "ChromaTransformerBlock",
         "ChromaSingleTransformerBlock",
     ]
 
-    # ------------------------------------------------------------------
-    # forward() is the entry-point that vllm-omni's diffusion executor
-    # calls.  We unpack the OmniDiffusionRequest and delegate to the
-    # parent's __call__ (the standard diffusers inference path).
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # THIS IS THE KEY FIX: accept od_config, use it to load the model
+    # via diffusers' from_pretrained, then init the parent with the
+    # loaded components.
+    # -----------------------------------------------------------------
+    def __init__(self, od_config: "OmniDiffusionConfig", **kwargs):
+        self._od_config = od_config
+
+        # Resolve model path from the omni config
+        model_path = od_config.model
+
+        # Let diffusers handle all weight loading, config parsing, etc.
+        tmp_pipe = DiffusersChromaPipeline.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+        )
+
+        # Initialise the parent DiffusionPipeline with loaded components
+        super().__init__(
+            scheduler=tmp_pipe.scheduler,
+            text_encoder=tmp_pipe.text_encoder,
+            tokenizer=tmp_pipe.tokenizer,
+            transformer=tmp_pipe.transformer,
+            vae=tmp_pipe.vae,
+        )
+
+    # -----------------------------------------------------------------
+    # forward() is called by vllm-omni's diffusion executor.
+    # Unpack the OmniDiffusionRequest and delegate to the standard
+    # diffusers __call__ path.
+    # -----------------------------------------------------------------
     def forward(self, request: "OmniDiffusionRequest"):
-        # --- seed / generator ----------------------------------------
         generator = None
         seed = getattr(request, "seed", None)
         if seed is not None:
             generator = torch.Generator("cpu").manual_seed(seed)
 
-        # --- call diffusers' full pipeline ----------------------------
         output = DiffusersChromaPipeline.__call__(
             self,
             prompt=request.prompt,
@@ -67,28 +78,12 @@ class ChromaPipeline(DiffusersChromaPipeline):
 # ======================================================================
 
 def get_chroma_pre_process_func(od_config: "OmniDiffusionConfig"):
-    """
-    Return the pre-processing callable for Chroma.
-
-    Chroma is a pure text-to-image pipeline, so there are no input
-    images to resize or encode.  Pre-processing is a pass-through.
-    """
-
     def pre_process(request: "OmniDiffusionRequest"):
         return request
-
     return pre_process
 
 
 def get_chroma_post_process_func(od_config: "OmniDiffusionConfig"):
-    """
-    Return the post-processing callable for Chroma.
-
-    Diffusers' ChromaPipeline already returns PIL images, so
-    post-processing is a pass-through.
-    """
-
     def post_process(images):
         return images
-
     return post_process
